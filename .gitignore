@@ -1,0 +1,7 @@
+.env
+.venv/
+uv.lock
+__pycache__/
+*.py[cod]
+data/dukaan.db
+.DS_Store
