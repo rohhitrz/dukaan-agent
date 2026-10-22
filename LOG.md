@@ -54,6 +54,10 @@ _(to fill in after using it - that's the point of the exercise)_
 
 ### First real conversation (3 turns, one session)
 
+Run via `curl` from the command line, session `real1`. Latencies here are **not**
+comparable to the UI run below - same questions, different session, different day,
+and the model's own response time varies a lot between calls.
+
 | Turn | Tools called | Steps | Latency |
 | ---- | ------------ | ----- | ------- |
 | "where is my order 1043" | `get_order`, `search_policy` | 3 | 11.9s |
@@ -66,6 +70,10 @@ refuse-delivery instead. Token count grew 615 -> 2,304 across three turns, becau
 every tool result stays in the history forever.
 
 ### Manual test run in the UI (6 turns, session `sess-4ioiuv`)
+
+A **separate run** from the curl one above, done by hand in the browser. Turn 1 asks
+the same question as turn 1 up there and took 6,949ms against 11.9s - the gap is
+run-to-run variance in the API, not a change in the code.
 
 Poked at it by hand to see where it breaks. Turn-by-turn:
 
