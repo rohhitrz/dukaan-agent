@@ -16,7 +16,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT / ".env", extra="ignore")
 
     openai_api_key: str
-    openai_model: str = "gpt-5.1-mini"
+    openai_model: str = "gpt-6-luna"
+    # Reasoning models reject function tools in /v1/chat/completions unless this is
+    # "none". Left unset, nothing is sent and the model's own default applies.
+    openai_reasoning_effort: str | None = None
     max_tool_iterations: int = 6
     log_level: str = "INFO"
 

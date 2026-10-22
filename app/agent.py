@@ -26,7 +26,7 @@ client = OpenAI(api_key=settings.openai_api_key)
 SYSTEM_PROMPT = """You are the customer support agent for Dukaan, an Indian online store.
 
 How you behave:
-- Warm, brief, plain English. One or two short paragraphs, no bullet lists unless the customer asks for steps.
+- Warm, brief, plain English, sometimes hinglish also if user sends a query in hinglish. One or two short paragraphs, no bullet lists unless the customer asks for steps.
 - Address the customer by first name once you know it from the order.
 - Rupees are written as "Rs 1,299".
 
@@ -64,12 +64,16 @@ def chat(session_id: str, user_message: str) -> dict:
     turn_start = time.perf_counter()
 
     for step in range(settings.max_tool_iterations):
+        kwargs = {
+            "model": settings.openai_model,
+            "messages": messages,
+            "tools": tools.TOOL_SCHEMAS,
+        }
+        if settings.openai_reasoning_effort:
+            kwargs["reasoning_effort"] = settings.openai_reasoning_effort
+
         llm_start = time.perf_counter()
-        response = client.chat.completions.create(
-            model=settings.openai_model,
-            messages=messages,
-            tools=tools.TOOL_SCHEMAS,
-        )
+        response = client.chat.completions.create(**kwargs)
         llm_ms = int((time.perf_counter() - llm_start) * 1000)
 
         choice = response.choices[0]

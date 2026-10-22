@@ -14,7 +14,16 @@ Built the whole thing from an empty folder:
 - `app/policy_search.py` - BM25 over the 6 policy files
 - `app/db.py` + `data/seed.sql` - SQLite, 20 orders, 23 line items, `refunds` and `tickets` tables
 - `static/index.html` - one page, shows each LLM call and tool call inline under the reply
-- Model: `gpt-5.1-mini` (set in `.env`, one line to swap)
+- Model: `gpt-6-luna` (set in `.env`, one line to swap)
+
+**Gotcha that cost a first run:** `gpt-6-luna` is a reasoning model, and
+`/v1/chat/completions` rejects function tools whenever a reasoning effort is in
+play - even the model's own default, which we never set. Fix was to send
+`reasoning_effort="none"` explicitly (`OPENAI_REASONING_EFFORT` in `.env`; left
+blank, nothing is sent). The other way out is the Responses API, which is the
+Phase 0 design decision we'd be reversing. Worth knowing that "none" means the
+model isn't reasoning before it picks tools - if tool selection looks sloppy in
+Phase 3, this knob is a suspect.
 
 Deliberately **no** guardrails: `issue_refund` will write any amount for any order id if the model asks. That is the baseline Phase 4 gets measured against.
 
@@ -42,6 +51,19 @@ _(to fill in after using it - that's the point of the exercise)_
 - Wrong answer I hit:
 - What I had to do to find the cause:
 - What the logs could not tell me:
+
+### First real conversation (3 turns, one session)
+
+| Turn | Tools called | Steps | Latency |
+| ---- | ------------ | ----- | ------- |
+| "where is my order 1043" | `get_order`, `search_policy` | 3 | 11.9s |
+| "can I return it when it arrives?" | `search_policy` | 2 | 3.0s |
+| "actually just cancel it" | `search_policy`, `get_order` | 3 | 7.6s |
+
+Memory held: turn 2 and 3 never repeated the order id, and the agent kept calling
+Meera by name. Turn 3 correctly refused to cancel a `shipped` order and offered
+refuse-delivery instead. Token count grew 615 -> 2,304 across three turns, because
+every tool result stays in the history forever.
 
 ### One surprising thing
 
