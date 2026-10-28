@@ -44,6 +44,7 @@
     font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: #3b3935;
   }
   .meta { color: var(--muted); font-size: 12px; margin: -8px 0 16px; }
+  .meta a { color: var(--muted); }
   .err { color: var(--err); }
   form {
     display: flex; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--line);
@@ -79,11 +80,18 @@
 
 <script>
   const sessionId = 'sess-' + Math.random().toString(36).slice(2, 8);
+  // One id per browser, kept across reloads: session_id groups a conversation in
+  // Langfuse, user_id groups every conversation this browser ever had.
+  let userId = localStorage.getItem('dukaan_user_id');
+  if (!userId) {
+    userId = 'web-' + Math.random().toString(36).slice(2, 8);
+    localStorage.setItem('dukaan_user_id', userId);
+  }
   const log = document.getElementById('log');
   const form = document.getElementById('form');
   const input = document.getElementById('input');
   const send = document.getElementById('send');
-  document.getElementById('sid').textContent = sessionId;
+  document.getElementById('sid').textContent = sessionId + ' / ' + userId;
 
   const el = (cls, html) => {
     const d = document.createElement('div');
@@ -98,7 +106,8 @@
   function renderTrace(trace) {
     const rows = trace.map(e => {
       if (e.kind === 'llm') {
-        return `<details><summary>llm &middot; ${e.latency_ms}ms &middot; ${e.prompt_tokens ?? '?'}&rarr;${e.completion_tokens ?? '?'} tokens &middot; ${esc(e.finish_reason)}</summary></details>`;
+        const cached = e.cached_tokens ? ` (${e.cached_tokens} cached)` : '';
+        return `<details><summary>llm &middot; ${e.latency_ms}ms &middot; ${e.prompt_tokens ?? '?'}${cached}&rarr;${e.completion_tokens ?? '?'} tokens &middot; ${esc(e.finish_reason)}</summary></details>`;
       }
       const failed = e.result && e.result.error ? ' class="err"' : '';
       return `<details><summary${failed}>${esc(e.name)}(${esc(JSON.stringify(e.args))}) &middot; ${e.latency_ms}ms</summary>`
@@ -121,14 +130,17 @@
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, message: text }),
+        body: JSON.stringify({ session_id: sessionId, message: text, user_id: userId }),
       });
       pending.remove();
       if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
       const data = await res.json();
       renderTrace(data.trace);
       el('msg agent', `<div class="bubble">${esc(data.reply)}</div>`);
-      el('meta', `${data.latency_ms}ms &middot; ${data.steps} llm call(s)`);
+      const link = data.trace_url
+        ? ` &middot; <a href="${data.trace_url}" target="_blank" rel="noreferrer">trace</a>`
+        : '';
+      el('meta', `${data.latency_ms}ms &middot; ${data.steps} llm call(s)${link}`);
     } catch (err) {
       pending.remove();
       el('meta err', esc(err.message));

@@ -120,3 +120,132 @@ differently. That gap is the entire reason Phase 3 exists.
 ### One surprising thing
 
 BM25 is more literal than it feels. "can I return shoes after 10 days" ranks `cancellations.md` **above** `returns_window.md`, because "return" appears in the cancellations text too and nothing in the query matches the word "window". Keyword search has no idea that "10 days" is the thing that matters. Worth remembering when Phase 3 shows ungrounded answers - the retrieval may be the culprit, not the model.
+
+## Phase 1 - Tracing
+
+**Date:** 2026-10-23
+
+### Decisions taken at the phase start
+
+- **Self-hosted, not cloud** (as planned). But a Langfuse was already running on
+  this machine for the sutra project, holding `:3000`/`:9090`. Rather than add a
+  second project inside it - which would make this repo depend on sutra's stack
+  being up - this project gets **its own stack on shifted ports**: web `:3100`,
+  MinIO `:9190`. Postgres/Redis/ClickHouse are not published at all; nothing
+  outside the compose network needs them.
+- `docker-compose.yml` is a trimmed copy of the official one: same six services
+  (Langfuse v3+ needs all of them - Postgres for app data, ClickHouse for traces,
+  Redis for the ingestion queue, MinIO for raw event blobs, web + worker), only
+  the settings this project uses.
+- **Headless init.** The `LANGFUSE_INIT_*` block creates the org, project, API
+  keys and first user on startup, so the keys are known up front and there is no
+  click-through setup. Login `dev@dukaan.local` / `dukaan-local-dev`, all local
+  throwaway.
+
+### What changed
+
+- `app/tracing.py` - new. Builds the Langfuse client, and if the keys are missing
+  builds it with `tracing_enabled=False` so every span becomes a no-op and the app
+  runs exactly as it did in Phase 0. No `if tracing_on:` branches anywhere else.
+- `app/agent.py` - `chat()` now opens one root span per user turn and the loop
+  opens a child span per LLM call and per tool call. The loop body itself is
+  unchanged.
+- `app/policy_search.py` - BM25 search gets its own `retriever` span.
+- `app/main.py` - `user_id` on the request, `tracing.check()` at startup,
+  `tracing.shutdown()` on exit, `trace_id`/`trace_url` on the response.
+- `static/index.html` - a per-browser `user_id` in localStorage, a "trace" link
+  under every reply, and cached tokens in the inline LLM row.
+
+One turn now looks like this (real trace, turn 1 of the run below):
+
+```
+chat-turn                      agent        4.31s
+  |- llm step=0                generation   1.52s  $0.000071
+  |- tool get_order            tool         0.00s
+  |- llm step=1                generation   1.19s  $0.000090
+  |- tool search_policy        tool         0.00s
+  |    +- policy_search bm25   retriever    0.00s
+  +- llm step=2                generation   1.57s  $0.000150
+```
+
+**Nothing is threaded through to make that nest.** The SDK is OpenTelemetry
+underneath, so `start_as_current_observation` makes its span the "current" one for
+the duration of the `with` block, and anything started inside becomes its child -
+including the BM25 span, which lives in a different file and is never told which
+tool call it belongs to.
+
+### Before vs after
+
+| | Phase 0 | Phase 1 |
+| - | ------- | ------- |
+| Where a turn lives | `logging.info` lines, gone on restart | a trace, kept |
+| Multi-turn | three unrelated log blobs | one session, 3 traces, totals rolled up |
+| What the model was sent | not recorded | full `messages` on every generation |
+| Cost | not measured | per LLM call, summed per turn and per session |
+| Tool failure | `{"error": ...}` in a log line | span marked WARNING with the message |
+| Linking a reply to its data | by timestamp, by hand | "trace" link under the reply |
+
+Spans cost microseconds in the request path - export is batched on a background
+thread - so the latency numbers stayed where Phase 0 left them.
+
+Two things fell out for free that I'd assumed were work:
+
+- **Cost needed no configuration.** Langfuse ships a pricing table and already
+  knows `gpt-6-luna` ($0.10/1M in, $0.50/1M out). `PRICE_PER_1M_INPUT/OUTPUT` are
+  in `.env` as an escape hatch for when it doesn't recognise a model, and stay 0.
+- **`session_id` was already the right key.** Phase 0 used it for in-memory
+  history; Langfuse groups traces by the same field, so the session view came for
+  nothing.
+
+### The check: which step was slowest? Which cost the most?
+
+Session `phase1-012303` - the same 3 turns as Phase 0's curl run. 10.05s, 12k
+tokens, $0.001 total. Read off the trace UI:
+
+| Turn | Slowest step | Costliest step |
+| ---- | ------------ | -------------- |
+| 1 | `llm step=2` 1.57s | `llm step=2` $0.000150 |
+| 2 | `llm step=0` 1.96s | `llm step=1` $0.000078 |
+| 3 | `llm step=2` 1.40s | `llm step=2` $0.000091 |
+
+**They are not the same question.** Turn 2's slowest call was also its *cheapest*:
+1.96s to produce 30 output tokens. Latency is dominated by whatever the model does
+before the first token; cost is dominated by output tokens, which are priced 5x
+input here. A "make it faster" change and a "make it cheaper" change would touch
+different steps.
+
+**Both tools are 0.00s.** SQLite and in-process BM25 round to zero against 1-2s
+model calls, so 100% of both budgets is the LLM. Worth remembering before
+optimising anything on the tool side - and it reframes Phase 0's complaint about
+the wasted `search_policy` call: the waste was never the search, it was the extra
+LLM round-trip the search forced.
+
+### One surprising thing
+
+**Prompt caching quietly cancels the token-growth problem Phase 0 flagged.**
+
+Phase 0 watched prompt tokens climb 615 -> 2,304 across three turns and called it
+"the cost curve to put on a chart in Phase 1". Splitting cached from uncached
+tokens on each generation shows the chart doesn't bend the way it looked:
+
+| Turn | step | uncached in | cached in | out | cost |
+| ---- | ---- | ----------: | --------: | --: | ---: |
+| 1 | 0 | 615 | 0 | 19 | $0.000071 |
+| 1 | 2 | 1,168 | 0 | 66 | $0.000150 |
+| 2 | 0 | 84 | 1,165 | 30 | $0.000035 |
+| 3 | 0 | 58 | 1,679 | 19 | $0.000032 |
+| 3 | 2 | 461 | 1,859 | 53 | $0.000091 |
+
+By turn 3 **80% of the prompt is a cache hit**, billed at a tenth of the price. The
+last call of turn 3 carries a far bigger prompt than the last call of turn 1 and
+costs **40% less** ($0.000091 vs $0.000150), because turn 1 paid full price for a
+cold prefix while turn 3 mostly re-read a warm one.
+
+So the Phase 0 worry - "off-topic messages still carry the whole history, they are
+not cheap" - is only half right. They are cheap in *rupees*; what they still cost is
+a full LLM round-trip of latency. Which is exactly what the table above says: the
+expensive axis here is time, not money.
+
+I would not have found this by staring at `usage.prompt_tokens`, which is the single
+number Phase 0 logged. It took splitting one field into two and letting something
+else multiply it by a price.

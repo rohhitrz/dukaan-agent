@@ -6,6 +6,11 @@ no model call, and good enough for six short documents.
 
 Each policy file is split into chunks on blank lines so a hit returns a few bullet
 points rather than a whole document.
+
+Phase 1 gives the search its own `retriever` span. It nests under whichever
+`tool search_policy` span is open, so the trace separates "the tool ran" from
+"this is what BM25 actually returned and how weakly it scored" - the thing
+Phase 0 found suspicious about this file.
 """
 
 import logging
@@ -13,6 +18,7 @@ import re
 
 from rank_bm25 import BM25Okapi
 
+from app import tracing
 from app.config import settings
 
 log = logging.getLogger(__name__)
@@ -48,12 +54,32 @@ def search(query: str, k: int = 3) -> list[dict]:
     if _bm25 is None:
         load_policies()
 
-    scores = _bm25.get_scores(_tokenize(query))
-    ranked = sorted(zip(scores, _chunks), key=lambda p: p[0], reverse=True)
-    hits = [
-        {"doc": c["doc"], "title": c["title"], "text": c["text"], "score": round(float(s), 3)}
-        for s, c in ranked[:k]
-        if s > 0
-    ]
+    with tracing.client.start_as_current_observation(
+        name="policy_search bm25",
+        as_type="retriever",
+        input={"query": query, "k": k},
+    ) as span:
+        scores = _bm25.get_scores(_tokenize(query))
+        ranked = sorted(zip(scores, _chunks), key=lambda p: p[0], reverse=True)
+        hits = [
+            {"doc": c["doc"], "title": c["title"], "text": c["text"], "score": round(float(s), 3)}
+            for s, c in ranked[:k]
+            if s > 0
+        ]
+        # top_score and the doc names are the two fields worth scanning when an
+        # answer turns out ungrounded: a weak top score means nothing matched, and
+        # the wrong doc at rank 1 means BM25 matched on the wrong word.
+        span.update(
+            output=hits,
+            metadata={
+                "hits": len(hits),
+                "chunks_indexed": len(_chunks),
+                "top_score": hits[0]["score"] if hits else 0.0,
+                "docs": [h["doc"] for h in hits],
+            },
+            level="WARNING" if not hits else None,
+            status_message="no policy chunk matched" if not hits else None,
+        )
+
     log.debug("policy_search %r -> %s", query, [(h["doc"], h["score"]) for h in hits])
     return hits

@@ -23,6 +23,21 @@ class Settings(BaseSettings):
     max_tool_iterations: int = 6
     log_level: str = "INFO"
 
+    # --- Phase 1: tracing ---
+    # Keys come from docker-compose.yml's LANGFUSE_INIT_* block. Leave them blank
+    # and tracing turns itself off (see app/tracing.py).
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "http://localhost:3100"
+    # Langfuse filters traces by environment and groups them by release, so later
+    # phases can sit in the same project without polluting Phase 1's numbers.
+    langfuse_environment: str = "local"
+    langfuse_release: str = "phase-1"
+    # USD per 1M tokens. Langfuse computes cost itself for models it knows; set
+    # these when it doesn't recognise the model and the cost column stays empty.
+    price_per_1m_input: float = 0.0
+    price_per_1m_output: float = 0.0
+
     db_path: Path = ROOT / "data" / "dukaan.db"
     seed_path: Path = ROOT / "data" / "seed.sql"
     policies_dir: Path = ROOT / "data" / "policies"
