@@ -57,6 +57,38 @@ Traces sharing a `session_id` are grouped into one session, so a whole conversat
 reads as a single thing with its own token and cost totals. Cost is computed by
 Langfuse from its own pricing table.
 
+## Failure injection
+
+`CHAOS_MODE=true` gives every turn a `CHAOS_RATE` chance of drawing one injected
+fault:
+
+| Fault | What breaks | Where it comes from |
+| ----- | ----------- | ------------------- |
+| `tool_timeout` | a tool hangs past `TOOL_TIMEOUT_S` and the loop gives up on it | `app/tools.py` |
+| `wrong_order_data` | one field of a `get_order` result is rewritten to something plausible but wrong | `app/chaos.py` |
+| `degraded_prompt` | the system prompt is truncated to its first line for the whole turn | `app/agent.py` |
+| `empty_policy` | BM25 returns no hits, however well the query matched | `app/policy_search.py` |
+
+**Nothing is tagged on the span.** The point of the phase is to find the root cause
+from the trace, so a fault shows only its symptom. What was actually injected is
+appended to `data/chaos_log.jsonl` keyed by `trace_id` - the answer key, to open
+*after* diagnosing:
+
+```json
+{"trace_id": "213e65...", "fault": "wrong_order_data", "fired": true,
+ "details": ["order 1042 delivery_date 2026-10-11 -> 2026-08-27"]}
+```
+
+Transient faults (slow tool, stale read) fire once per turn; state faults
+(truncated prompt, dead retriever) hold for the whole turn. `CHAOS_FORCE` pins one
+fault, `CHAOS_FAULTS` narrows the pool, `CHAOS_SEED` makes the draw reproducible.
+`wrong_order_data` rewrites the tool's result on the way out and never touches the
+database, so `sqlite3 data/dukaan.db` is the tiebreaker once a trace looks wrong.
+
+Tools now run on a small thread pool so the loop can stop waiting on one that hangs.
+The caller's context is copied into the worker, without which the retriever span
+would detach from its tool span into a trace of its own.
+
 ## Run it
 
 ```bash
@@ -92,11 +124,15 @@ after the agent has issued test refunds.
 | `OPENAI_MODEL` | default `gpt-6-luna` |
 | `OPENAI_REASONING_EFFORT` | must be `none` for reasoning models - they reject function tools in `/v1/chat/completions` otherwise. Leave blank to send nothing. |
 | `MAX_TOOL_ITERATIONS` | loop safety net, default 6 |
+| `TOOL_TIMEOUT_S` | deadline for one tool call, default 5. Real tools take ~0ms; this only fires on a hung tool or on `tool_timeout` chaos |
 | `LOG_LEVEL` | `DEBUG` for the full loop |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | from `docker-compose.yml`. Blank disables tracing. |
 | `LANGFUSE_HOST` | default `http://localhost:3100` |
 | `LANGFUSE_ENVIRONMENT` / `LANGFUSE_RELEASE` | Langfuse filters by the first, groups by the second - one project can hold every phase |
 | `PRICE_PER_1M_INPUT` / `PRICE_PER_1M_OUTPUT` | USD. Only needed when Langfuse doesn't know the model's price; it knows `gpt-6-luna`, so these stay 0 |
+| `CHAOS_MODE` | default off. On, injects one fault per turn - see [Failure injection](#failure-injection) |
+| `CHAOS_RATE` | chance a turn draws a fault, default 0.35 |
+| `CHAOS_FAULTS` / `CHAOS_FORCE` / `CHAOS_SEED` | narrow the pool / pin one fault / make the draw reproducible |
 
 ## Phases
 
@@ -104,8 +140,8 @@ after the agent has issued test refunds.
 | - | ----- | ----- |
 | 0 | Baseline agent, no observability | done |
 | 1 | Tracing with self-hosted Langfuse | done |
-| 2 | Failure hunt via `CHAOS_MODE` injection | next |
-| 3 | Offline evals - hand-written dataset, code + LLM-judge scorers | |
+| 2 | Failure hunt via `CHAOS_MODE` injection | done |
+| 3 | Offline evals - hand-written dataset, code + LLM-judge scorers | next |
 | 4 | Guardrails (input / tool-level / output), re-run the same evals | |
 | 5 | Online signals - 👍/👎 → scores, judge on live traces | |
 | 6 | Change one thing, see if evals catch the regression | |
@@ -119,10 +155,12 @@ app/
   tools.py         four tools + their JSON schemas
   policy_search.py BM25 over the policy docs
   tracing.py       Langfuse client + span helpers
+  chaos.py         Phase 2 fault injection + answer key
   db.py            SQLite
 data/
   seed.sql         20 orders
   policies/        six policy docs
+  chaos_log.jsonl  what chaos injected, keyed by trace_id (generated)
 static/index.html  chat UI, shows the loop inline
 docker-compose.yml self-hosted Langfuse
 evals/             Phase 3

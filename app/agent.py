@@ -20,6 +20,11 @@ Phase 1 wraps those same steps in Langfuse spans. The shape of one turn:
     +- ...
 
 Nothing is passed around to make that nest - see the note in app/tracing.py.
+
+Phase 2 adds CHAOS_MODE. One fault is drawn per turn before anything runs and
+recorded to the answer key after, with the trace_id to match it to a trace. The
+loop body still does not know chaos exists; the one fault visible from here is
+`degraded_prompt`, because the system message is built here.
 """
 
 import json
@@ -29,7 +34,7 @@ import time
 from langfuse import propagate_attributes
 from openai import OpenAI
 
-from app import tools, tracing
+from app import chaos, tools, tracing
 from app.config import settings
 
 log = logging.getLogger(__name__)
@@ -75,6 +80,10 @@ def chat(session_id: str, user_message: str, user_id: str | None = None) -> dict
     # the trace itself, not just on one observation. Langfuse groups traces with the
     # same session_id into a session view - that is what makes a 3-turn conversation
     # readable as one thing.
+    # Drawn before the root span opens so every step of the turn runs under the same
+    # fault - including the first LLM call, which is where degraded_prompt shows up.
+    fault = chaos.begin()
+
     with propagate_attributes(
         session_id=session_id,
         user_id=user_id,
@@ -101,6 +110,10 @@ def chat(session_id: str, user_message: str, user_id: str | None = None) -> dict
             # report None rather than a fake id the UI would link to.
             result["trace_id"] = root.trace_id if tracing.enabled else None
             result["trace_url"] = tracing.trace_url(root.trace_id)
+
+    # Write the answer key last, so it carries the trace_id the hunt starts from.
+    # Deliberately *not* on the trace: see the top of app/chaos.py.
+    chaos.end(fault, trace_id=result["trace_id"], session_id=session_id, message=user_message)
     return result
 
 
@@ -112,9 +125,14 @@ def _run_turn(session_id: str, user_message: str) -> dict:
     turn_start = time.perf_counter()
 
     for step in range(settings.max_tool_iterations):
+        # chaos.system_prompt returns the prompt unchanged unless this turn drew
+        # degraded_prompt. The swap happens on the way out to the API only - the
+        # stored history keeps the real prompt, so the next turn is unaffected and
+        # the fault cannot leak between turns.
+        sent = [{"role": "system", "content": chaos.system_prompt(SYSTEM_PROMPT)}] + messages[1:]
         kwargs = {
             "model": settings.openai_model,
-            "messages": messages,
+            "messages": sent,
             "tools": tools.TOOL_SCHEMAS,
         }
         if settings.openai_reasoning_effort:
@@ -125,8 +143,9 @@ def _run_turn(session_id: str, user_message: str) -> dict:
             as_type="generation",
             model=settings.openai_model,
             # Everything the model was given, so a wrong answer can be replayed
-            # from the trace alone. This is the single most useful field in Phase 2.
-            input=messages,
+            # from the trace alone. This is the single most useful field in Phase 2:
+            # `sent`, not `messages`, so a degraded system prompt is visible here.
+            input=sent,
             model_parameters={"reasoning_effort": settings.openai_reasoning_effort},
         ) as gen:
             llm_start = time.perf_counter()

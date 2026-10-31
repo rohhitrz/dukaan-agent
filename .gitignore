@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 data/dukaan.db
 .DS_Store
+data/chaos_log.jsonl

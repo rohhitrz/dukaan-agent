@@ -6,11 +6,19 @@ something to recover from instead of blowing up the request.
 
 Phase 0 deliberately has *no* guardrails here: issue_refund will do whatever it is
 told as long as the SQL is valid. That is the baseline Phase 4 gets compared against.
+
+Phase 2 adds two things: every tool now runs under a deadline, and two of the chaos
+faults are injected from here (see app/chaos.py). Both are no-ops in a normal run.
 """
 
+import contextvars
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 
-from app import db
+from app import chaos, db
+from app.config import settings
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +41,9 @@ def get_order(order_id: int) -> dict:
             (order_id,),
         ).fetchall()
 
-    return {
+    # chaos.corrupt_order may rewrite one field on the way out. The row on disk is
+    # untouched, so `sqlite3 data/dukaan.db` is the tiebreaker when a trace looks wrong.
+    return chaos.corrupt_order({
         "order_id": order["order_id"],
         "customer_name": order["customer_name"],
         "status": order["status"],
@@ -43,7 +53,7 @@ def get_order(order_id: int) -> dict:
         "delivery_date": order["delivery_date"],
         "items": [dict(i) for i in items],
         "existing_refunds": [dict(r) for r in refunds],
-    }
+    })
 
 
 def search_policy(query: str) -> dict:
@@ -171,8 +181,16 @@ REGISTRY = {
 }
 
 
+# Tools run on this pool so the loop can stop waiting on one that hangs. A Python
+# thread cannot be killed from outside, so a timed-out call keeps running in the
+# background and its worker stays busy until it finishes - fine for four fast tools,
+# worth knowing if a future tool can block forever.
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool")
+
+
 def call_tool(name: str, args: dict, session_id: str | None = None) -> dict:
-    """Dispatch a tool call by name. Unknown names and bad args come back as errors."""
+    """Dispatch a tool call by name. Unknown names, bad args and timeouts come back
+    as errors, so the agent loop always has something to hand the model."""
     fn = REGISTRY.get(name)
     if fn is None:
         return {"error": f"Unknown tool {name!r}"}
@@ -180,8 +198,34 @@ def call_tool(name: str, args: dict, session_id: str | None = None) -> dict:
     if name == "escalate_to_human":
         args = {**args, "session_id": session_id}
 
-    try:
+    # Set when the loop stops waiting. Once the model has been told this call failed,
+    # the worker must not go on to do the work: issue_refund would write a refund the
+    # model believes never happened, and its retry would write a second one.
+    abandoned = threading.Event()
+
+    def run() -> dict:
+        chaos.before_tool(name)  # Phase 2: may sleep past the deadline below
+        if abandoned.is_set():
+            return {"error": f"{name} abandoned after timeout"}
         return fn(**args)
+
+    # A new thread starts with an empty context, and both the OpenTelemetry current
+    # span and chaos's per-turn fault live in ContextVars. Without copying the
+    # context across, policy_search's retriever span would detach into its own trace
+    # and the chaos hooks inside a tool would never see the fault. copy_context()
+    # snapshots the caller's context and ctx.run replays the call inside it.
+    ctx = contextvars.copy_context()
+    future = _POOL.submit(ctx.run, run)
+    try:
+        return future.result(timeout=settings.tool_timeout_s)
+    except FutureTimeout:
+        # The model sees the error and can retry or escalate, which is the behaviour
+        # Phase 2 hunts for. This stops a call that has not started its work yet. One
+        # already hung inside fn cannot be stopped, so a real hang mid-write could still
+        # land late - Phase 4's refund checks are the proper guard against a double refund.
+        abandoned.set()
+        log.warning("tool %s exceeded %.1fs deadline", name, settings.tool_timeout_s)
+        return {"error": f"{name} timed out after {settings.tool_timeout_s:g}s"}
     except TypeError as e:
         return {"error": f"Bad arguments for {name}: {e}"}
     except Exception as e:  # keep the loop alive; the model can read the error

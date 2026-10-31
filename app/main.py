@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app import agent, db, policy_search, tracing
+from app import agent, chaos, db, policy_search, tracing
 from app.config import settings
 
 logging.basicConfig(
@@ -25,6 +25,16 @@ async def lifespan(app: FastAPI):
     policy_search.load_policies()
     tracing.check()
     log.info("model=%s max_tool_iterations=%d", settings.openai_model, settings.max_tool_iterations)
+    if chaos.enabled:
+        # Loud on purpose: every number measured while this is on is suspect.
+        log.warning(
+            "CHAOS_MODE ON - faults=%s rate=%.2f force=%r seed=%s -> answer key at %s",
+            settings.chaos_faults or "all",
+            settings.chaos_rate,
+            settings.chaos_force or None,
+            settings.chaos_seed,
+            settings.chaos_log_path,
+        )
     yield
     # Spans are exported on a background thread; without this, whatever is still
     # queued when the process exits is lost.
@@ -76,7 +86,12 @@ def reset(session_id: str) -> dict:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "model": settings.openai_model, "tracing": tracing.enabled}
+    return {
+        "ok": True,
+        "model": settings.openai_model,
+        "tracing": tracing.enabled,
+        "chaos": chaos.enabled,
+    }
 
 
 @app.get("/")

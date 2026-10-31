@@ -18,7 +18,7 @@ import re
 
 from rank_bm25 import BM25Okapi
 
-from app import tracing
+from app import chaos, tracing
 from app.config import settings
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,10 @@ def search(query: str, k: int = 3) -> list[dict]:
             for s, c in ranked[:k]
             if s > 0
         ]
+        # Phase 2: chaos may drop every hit here. The span still reports
+        # chunks_indexed, so "the index is empty" and "nothing matched a query that
+        # should have matched" look different in the trace.
+        hits = chaos.empty_policy(hits)
         # top_score and the doc names are the two fields worth scanning when an
         # answer turns out ungrounded: a weak top score means nothing matched, and
         # the wrong doc at rank 1 means BM25 matched on the wrong word.

@@ -7,6 +7,7 @@ None halfway through a request.
 
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +22,9 @@ class Settings(BaseSettings):
     # "none". Left unset, nothing is sent and the model's own default applies.
     openai_reasoning_effort: str | None = None
     max_tool_iterations: int = 6
+    # Deadline for one tool call. Real tools here take ~0ms against 1-2s model
+    # calls, so this only ever fires on a hung tool - or on Phase 2 chaos.
+    tool_timeout_s: float = 5.0
     log_level: str = "INFO"
 
     # --- Phase 1: tracing ---
@@ -38,10 +42,34 @@ class Settings(BaseSettings):
     price_per_1m_input: float = 0.0
     price_per_1m_output: float = 0.0
 
+    # --- Phase 2: failure injection ---
+    # Off by default. On, each turn has a chaos_rate chance of drawing one fault
+    # from chaos_faults (blank = all four). chaos_force pins one fault for every
+    # turn; chaos_seed makes the random draw reproducible. See app/chaos.py.
+    chaos_mode: bool = False
+    chaos_rate: float = 0.35
+    chaos_faults: str = ""
+    chaos_force: str = ""
+    chaos_seed: int | None = None
+
     db_path: Path = ROOT / "data" / "dukaan.db"
     seed_path: Path = ROOT / "data" / "seed.sql"
     policies_dir: Path = ROOT / "data" / "policies"
     static_dir: Path = ROOT / "static"
+    # The Phase 2 answer key: what chaos injected, keyed by trace_id. Read it
+    # only after diagnosing a trace.
+    chaos_log_path: Path = ROOT / "data" / "chaos_log.jsonl"
+
+
+    @field_validator("chaos_seed", mode="before")
+    @classmethod
+    def _blank_is_none(cls, v: object) -> object:
+        """`CHAOS_SEED=` with nothing after it means "unseeded", not "".
+
+        pydantic reads an empty env var as an empty string and then fails to parse it
+        as an int, so a commented-out-by-blanking line would stop the app booting.
+        """
+        return None if v == "" else v
 
 
 settings = Settings()
